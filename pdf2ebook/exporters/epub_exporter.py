@@ -114,22 +114,36 @@ class EPUBExporter:
         )
         book.add_item(css_item)
 
-        # 生成章节
-        epub_chapters: List[epub.EpubHtml] = []
+        # 生成章节 + 收集 H2 锚点
+        chapter_data: List[Tuple[epub.EpubHtml, List[Tuple[str, str]]]] = []
         for idx, chapter in enumerate(document.chapters):
-            ep_chap = self._build_chapter(chapter, idx, book, css_item)
+            ep_chap, h2_anchors = self._build_chapter(chapter, idx, book, css_item)
             book.add_item(ep_chap)
-            epub_chapters.append(ep_chap)
+            chapter_data.append((ep_chap, h2_anchors))
 
-        # 目录
-        book.toc = [
-            epub.Link(ch.file_name, ch.title or f"第{i+1}章", f"chap_{i}")
-            for i, ch in enumerate(epub_chapters)
-        ]
+        # ── 构建分层目录（NCX + Nav）──────────────────────────────────────
+        # Kindle 及 EPUB 3 阅读器均支持两级目录（章 → 节）
+        toc = []
+        for idx, (ep_chap, h2_anchors) in enumerate(chapter_data):
+            chap_title = ep_chap.title or f"第{idx + 1}章"
+            chap_link = epub.Link(ep_chap.file_name, chap_title, f"nav_chap_{idx}")
+            if h2_anchors:
+                section_links = [
+                    epub.Link(
+                        f"{ep_chap.file_name}#{aid}",
+                        h2_text,
+                        f"nav_{idx}_{i}",
+                    )
+                    for i, (aid, h2_text) in enumerate(h2_anchors)
+                ]
+                toc.append((epub.Section(chap_title, ep_chap.file_name), section_links))
+            else:
+                toc.append(chap_link)
 
+        book.toc = toc
         book.add_item(epub.EpubNcx())
         book.add_item(epub.EpubNav())
-        book.spine = ["nav"] + epub_chapters
+        book.spine = ["nav"] + [ep_chap for ep_chap, _ in chapter_data]
 
         epub.write_epub(output_path, book)
         print(f"  ✓ EPUB:  {output_path}")
@@ -141,12 +155,29 @@ class EPUBExporter:
         idx: int,
         book: epub.EpubBook,
         css_item: epub.EpubItem,
-    ) -> epub.EpubHtml:
+    ) -> Tuple[epub.EpubHtml, List[Tuple[str, str]]]:
+        """
+        构建单个章节的 XHTML 内容。
+
+        返回值：
+          (EpubHtml, h2_anchors)
+          h2_anchors 是 (anchor_id, heading_text) 的列表，用于生成分层目录。
+        """
         html_parts: List[str] = []
+        h2_anchors: List[Tuple[str, str]] = []
+        h2_counter = 0
 
         for elem in chapter.elements:
             if isinstance(elem, TextBlock):
-                html_parts.append(self._render_text(elem))
+                if elem.is_heading and elem.heading_level in (HeadingLevel.H2, HeadingLevel.H3):
+                    h2_counter += 1
+                    anchor_id = f"s{idx}_{h2_counter}"
+                    tag = f"h{elem.heading_level.value}"
+                    html_parts.append(f'  <{tag} id="{anchor_id}">{_esc(elem.text)}</{tag}>')
+                    if elem.heading_level == HeadingLevel.H2:
+                        h2_anchors.append((anchor_id, elem.text))
+                else:
+                    html_parts.append(self._render_text(elem))
             elif isinstance(elem, ImageBlock):
                 self._img_counter += 1
                 img_item = self._add_image(elem, book, self._img_counter)
@@ -178,7 +209,7 @@ class EPUBExporter:
         )
         chap.content = xhtml.encode("utf-8")
         chap.add_item(css_item)
-        return chap
+        return chap, h2_anchors
 
     def _render_text(self, block: TextBlock) -> str:
         text = _esc(block.text)
