@@ -17,6 +17,19 @@ from pathlib import Path
 from typing import List, Optional
 
 from PIL import Image
+from rich.console import Console
+from rich.panel import Panel
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
+from rich.table import Table
 
 from .document_model import (
     Chapter, Document, DocumentElement, HeadingLevel, ImageBlock, TextBlock
@@ -26,6 +39,8 @@ from .exporters.typst_exporter import TypstExporter
 from .layout_analyzer import HeaderFooterFilter, LayoutAnalyzer, SENTENCE_END_RE
 from .ocr_processor import OCRProcessor, OCRResult
 from .pdf_renderer import PDFRenderer
+
+_console = Console()
 
 
 def _ends_sentence(text: str) -> bool:
@@ -117,68 +132,125 @@ class Pipeline:
     def run(self) -> None:
         os.makedirs(self.output_dir, exist_ok=True)
 
-        self._log(f"开始处理：{self.pdf_path}")
+        _console.print(Panel(
+            f"[bold cyan]PDF2Ebook[/]  →  [white]{self.pdf_path}[/]\n"
+            f"输出目录：[dim]{self.output_dir}[/]  |  格式：[yellow]{self.output_format}[/]  |  DPI：{self.dpi}",
+            title="[bold]任务配置[/]",
+            border_style="blue",
+        ))
+
         document = self._build_document()
-        self._log(f"共识别 {sum(len(c.elements) for c in document.chapters)} 个元素，"
-                  f"{len(document.chapters)} 个章节")
 
-        if self.output_format in ("typst", "both"):
-            self._log(f"导出 Typst → {self.typst_path}")
-            TypstExporter().export(document, self.typst_path)
+        elem_count = sum(len(c.elements) for c in document.chapters)
+        ch_count = len(document.chapters)
 
-        if self.output_format in ("epub", "both"):
-            self._log(f"导出 EPUB  → {self.epub_path}")
-            EPUBExporter().export(document, self.epub_path)
+        # ── 统计表格 ────────────────────────────────────────────────────
+        tbl = Table(show_header=False, box=None, pad_edge=False)
+        tbl.add_column(style="dim", width=16)
+        tbl.add_column(style="bold green")
+        tbl.add_row("识别章节数", str(ch_count))
+        tbl.add_row("识别元素数", str(elem_count))
+        _console.print(Panel(tbl, title="[bold]识别结果[/]", border_style="green"))
 
-        self._log("完成。")
+        # ── 导出 ────────────────────────────────────────────────────────
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            TimeElapsedColumn(),
+            console=_console,
+            transient=False,
+        ) as progress:
+            export_task = progress.add_task("[bold]导出文件[/]", total=2 if self.output_format == "both" else 1)
+
+            if self.output_format in ("typst", "both"):
+                progress.update(export_task, description=f"[cyan]导出 Typst[/] → [dim]{self.typst_path}[/]")
+                TypstExporter().export(document, self.typst_path)
+                progress.advance(export_task)
+
+            if self.output_format in ("epub", "both"):
+                progress.update(export_task, description=f"[cyan]导出 EPUB[/]  → [dim]{self.epub_path}[/]")
+                EPUBExporter().export(document, self.epub_path)
+                progress.advance(export_task)
+
+            progress.update(export_task, description="[green]导出完成[/]")
+
+        _console.print("[bold green]✓ 全部完成！[/]")
 
     # ──────────────────────────────────────────────────────────────────────
     def _build_document(self) -> Document:
         ocr = OCRProcessor(lang=self.lang)
         analyzer = LayoutAnalyzer()
 
-        # ── 第一遍：OCR + 缓存页面图像字节 + 收集页眉/页脚候选 ────────────
-        self._log("第一遍：OCR 识别 …")
-        ocr_results: List[OCRResult] = []
-        page_jpeg_bytes: List[bytes] = []
-        hf_filter = HeaderFooterFilter()
+        # 构造通用进度条样式
+        progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(bar_width=36),
+            MofNCompleteColumn(),
+            TextColumn("[dim]页[/]"),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            console=_console,
+            transient=False,
+        )
 
-        with PDFRenderer(self.pdf_path, dpi=self.dpi) as renderer:
-            total = len(renderer)
-            self._log(f"共 {total} 页")
-            for page_num, page_image in renderer.iter_pages():
-                self._log(f"  OCR 第 {page_num + 1}/{total} 页 …", end="\r")
-                result = ocr.process(page_image)
-                ocr_results.append(result)
-                hf_filter.collect(result)
+        with progress:
+            # ── 第一遍：OCR + 缓存页面图像字节 + 收集页眉/页脚候选 ────────
+            with PDFRenderer(self.pdf_path, dpi=self.dpi) as renderer:
+                total = len(renderer)
 
-                # 将页面图像压缩为 JPEG 字节缓存（约 200–400 KB/页）
-                buf = io.BytesIO()
-                page_image.convert("RGB").save(buf, format="JPEG", quality=82)
-                page_jpeg_bytes.append(buf.getvalue())
+            if self.verbose:
+                _console.print(f"[dim]  PDF 共 {total} 页，DPI={self.dpi}，语言={self.lang}[/]")
 
-        self._log("")
-        hf_filter.finalize()
-        self._log(f"  检测到 {len(hf_filter._excluded)} 条页眉/页脚模板")
+            ocr_task = progress.add_task(
+                "[cyan]第一遍[/]  OCR 识别", total=total
+            )
 
-        # ── 第二遍：版面分析（使用已 finalize 的 hf_filter）────────────────
-        self._log("第二遍：版面分析 …")
-        raw_page_elements: List[List[DocumentElement]] = []
+            ocr_results: List[OCRResult] = []
+            page_jpeg_bytes: List[bytes] = []
+            hf_filter = HeaderFooterFilter()
 
-        for page_num, (ocr_result, jpeg_bytes) in enumerate(
-            zip(ocr_results, page_jpeg_bytes)
-        ):
-            self._log(f"  分析第 {page_num + 1}/{total} 页 …", end="\r")
-            page_image = Image.open(io.BytesIO(jpeg_bytes))
-            elements = analyzer.analyze_page(ocr_result, page_image, hf_filter)
-            raw_page_elements.append(elements)
+            with PDFRenderer(self.pdf_path, dpi=self.dpi) as renderer:
+                for _page_num, page_image in renderer.iter_pages():
+                    result = ocr.process(page_image)
+                    ocr_results.append(result)
+                    hf_filter.collect(result)
 
-        self._log("")
+                    buf = io.BytesIO()
+                    page_image.convert("RGB").save(buf, format="JPEG", quality=82)
+                    page_jpeg_bytes.append(buf.getvalue())
 
-        # ── 后处理：跨页段落合并 ─────────────────────────────────────────
-        merged = _merge_cross_page_paragraphs(raw_page_elements)
+                    progress.advance(ocr_task)
+
+            hf_filter.finalize()
+            if self.verbose:
+                _console.print(
+                    f"[dim]  检测到 {len(hf_filter._excluded)} 条页眉/页脚模板[/]"
+                )
+
+            # ── 第二遍：版面分析 ─────────────────────────────────────────
+            analyze_task = progress.add_task(
+                "[cyan]第二遍[/]  版面分析", total=total
+            )
+
+            raw_page_elements: List[List[DocumentElement]] = []
+
+            for _page_num, (ocr_result, jpeg_bytes) in enumerate(
+                zip(ocr_results, page_jpeg_bytes)
+            ):
+                page_image = Image.open(io.BytesIO(jpeg_bytes))
+                elements = analyzer.analyze_page(ocr_result, page_image, hf_filter)
+                raw_page_elements.append(elements)
+                progress.advance(analyze_task)
+
+            # ── 跨页段落合并（无 I/O，无需进度条）────────────────────────
+            progress.add_task("[cyan]后处理[/]  跨页段落合并", total=None)
 
         # ── 按 H1 标题切分章节 ────────────────────────────────────────────
+        merged = _merge_cross_page_paragraphs(raw_page_elements)
+
         document = Document(title=self.title, author=self.author)
         current_chapter = Chapter(title="")
         document.chapters.append(current_chapter)
@@ -199,8 +271,3 @@ class Pipeline:
             document.chapters = [Chapter(title=self.title)]
 
         return document
-
-    # ──────────────────────────────────────────────────────────────────────
-    def _log(self, msg: str, end: str = "\n") -> None:
-        if self.verbose or end == "\n":
-            print(msg, end=end, flush=True)

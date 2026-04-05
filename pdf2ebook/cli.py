@@ -3,8 +3,11 @@
 import sys
 
 import click
+from rich.console import Console
 
 from .pipeline import Pipeline
+
+_err_console = Console(stderr=True)
 
 
 @click.command(context_settings={"help_option_names": ["-h", "--help"]})
@@ -68,10 +71,10 @@ def main(
         )
         pipeline.run()
     except Exception as exc:  # noqa: BLE001
-        click.echo(f"错误：{exc}", err=True)
+        _err_console.print(f"[bold red]错误：[/]{exc}")
         if verbose:
             import traceback
-            traceback.print_exc()
+            _err_console.print_exception()
         sys.exit(1)
 
 
