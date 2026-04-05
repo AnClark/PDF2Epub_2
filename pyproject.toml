@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=67", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "pdf2ebook"
+version = "0.1.0"
+description = "将扫描版PDF转换为EPUB和Typst格式的CLI工具"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "click>=8.0",
+    "pytesseract>=0.3.10",
+    "Pillow>=9.0",
+    "ebooklib>=0.18",
+    "lxml>=4.9",
+    "pymupdf>=1.22",
+    "numpy>=1.21",
+]
+
+[project.scripts]
+pdf2ebook = "pdf2ebook.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pdf2ebook*"]

@@ -1,0 +1,7 @@
+click>=8.0
+pytesseract>=0.3.10
+Pillow>=9.0
+ebooklib>=0.18
+lxml>=4.9
+pymupdf>=1.22
+numpy>=1.21
