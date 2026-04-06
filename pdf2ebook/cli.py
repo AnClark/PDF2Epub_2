@@ -40,6 +40,13 @@ _err_console = Console(stderr=True)
 @click.option("--title", "-t", default=None, help="书名（默认取文件名）")
 @click.option("--author", "-a", default=None, help="作者名")
 @click.option("--verbose", "-v", is_flag=True, default=False, help="显示详细进度")
+@click.option(
+    "--workers", "-w",
+    default=1,
+    show_default=True,
+    metavar="N",
+    help="并行 OCR 线程数（建议 ≤ CPU 核心数；1 = 串行）",
+)
 def main(
     pdf_file: str,
     output: str,
@@ -49,6 +56,7 @@ def main(
     title: str,
     author: str,
     verbose: bool,
+    workers: int,
 ) -> None:
     """将扫描版 PDF 书籍转换为 EPUB 和/或 Typst 格式。
 
@@ -57,6 +65,7 @@ def main(
       pdf2ebook book.pdf
       pdf2ebook book.pdf -o ./output -f epub -t "书名" -a "作者"
       pdf2ebook book.pdf --dpi 400 --lang chi_tra
+      pdf2ebook book.pdf --workers 4
     """
     try:
         pipeline = Pipeline(
@@ -68,6 +77,7 @@ def main(
             title=title,
             author=author,
             verbose=verbose,
+            workers=workers,
         )
         pipeline.run()
     except Exception as exc:  # noqa: BLE001

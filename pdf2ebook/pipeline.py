@@ -1,10 +1,12 @@
 """
 转换流水线：PDF → Document → EPUB / Typst
 
-流程（v2 两遍扫描）：
-  第一遍 — OCR：逐页渲染并识别文字，缓存 OCRResult 和 JPEG 图像字节；
+流程（v3 三阶段，支持并行 OCR）：
+  阶段 0 — 渲染：逐页将 PDF 渲染为 JPEG 字节缓存（串行，速度快）。
+  阶段 1 — OCR：使用 ThreadPoolExecutor 并行对各页执行 Tesseract 识别；
            同时向 HeaderFooterFilter 收集页眉/页脚候选文本。
-  第二遍 — 版面分析：利用缓存数据重建元素列表（标题/段落/图片），
+           workers=1 等价于完全串行，不引入额外开销。
+  阶段 2 — 版面分析：利用缓存数据重建元素列表（标题/段落/图片），
            HeaderFooterFilter 已 finalize()，过滤精度更高。
   后处理 — 跨页段落合并：检测上一页末尾未完结的段落，与下一页首段合并。
   导出   — 调用对应导出器输出 EPUB / Typst 文件。
@@ -13,6 +15,7 @@
 import io
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Optional
 
@@ -41,6 +44,17 @@ from .ocr_processor import OCRProcessor, OCRResult
 from .pdf_renderer import PDFRenderer
 
 _console = Console()
+
+
+def _ocr_worker(page_num: int, jpeg_bytes: bytes, lang: str):
+    """线程 Worker：对单页 JPEG 字节执行 OCR，返回 (page_num, OCRResult)。
+
+    在独立线程中创建 OCRProcessor 实例以避免共享状态；
+    pytesseract 调用外部 tesseract 进程，天然释放 GIL，适合多线程并行。
+    """
+    img = Image.open(io.BytesIO(jpeg_bytes))
+    result = OCRProcessor(lang=lang).process(img)
+    return page_num, result
 
 
 def _ends_sentence(text: str) -> bool:
@@ -114,6 +128,7 @@ class Pipeline:
         title: Optional[str] = None,
         author: Optional[str] = None,
         verbose: bool = False,
+        workers: int = 1,
     ) -> None:
         self.pdf_path = pdf_path
         self.output_dir = output_dir
@@ -121,6 +136,7 @@ class Pipeline:
         self.lang = lang
         self.dpi = dpi
         self.verbose = verbose
+        self.workers = max(1, workers)
 
         stem = Path(pdf_path).stem
         self.title = title or stem
@@ -134,7 +150,8 @@ class Pipeline:
 
         _console.print(Panel(
             f"[bold cyan]PDF2Ebook[/]  →  [white]{self.pdf_path}[/]\n"
-            f"输出目录：[dim]{self.output_dir}[/]  |  格式：[yellow]{self.output_format}[/]  |  DPI：{self.dpi}",
+            f"输出目录：[dim]{self.output_dir}[/]  |  格式：[yellow]{self.output_format}[/]  "
+            f"|  DPI：{self.dpi}  |  OCR 线程：[yellow]{self.workers}[/]",
             title="[bold]任务配置[/]",
             border_style="blue",
         ))
@@ -180,10 +197,8 @@ class Pipeline:
 
     # ──────────────────────────────────────────────────────────────────────
     def _build_document(self) -> Document:
-        ocr = OCRProcessor(lang=self.lang)
         analyzer = LayoutAnalyzer()
 
-        # 构造通用进度条样式
         progress = Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -197,55 +212,71 @@ class Pipeline:
         )
 
         with progress:
-            # ── 第一遍：OCR + 缓存页面图像字节 + 收集页眉/页脚候选 ────────
+            # ── 阶段 0：串行渲染所有页面为 JPEG 字节缓存 ─────────────────
             with PDFRenderer(self.pdf_path, dpi=self.dpi) as renderer:
                 total = len(renderer)
 
             if self.verbose:
-                _console.print(f"[dim]  PDF 共 {total} 页，DPI={self.dpi}，语言={self.lang}[/]")
+                _console.print(
+                    f"[dim]  PDF 共 {total} 页，DPI={self.dpi}，"
+                    f"语言={self.lang}，OCR 线程={self.workers}[/]"
+                )
 
-            ocr_task = progress.add_task(
-                "[cyan]第一遍[/]  OCR 识别", total=total
-            )
-
-            ocr_results: List[OCRResult] = []
+            render_task = progress.add_task("[cyan]阶段 0[/]  渲染页面", total=total)
             page_jpeg_bytes: List[bytes] = []
-            hf_filter = HeaderFooterFilter()
 
             with PDFRenderer(self.pdf_path, dpi=self.dpi) as renderer:
                 for _page_num, page_image in renderer.iter_pages():
-                    result = ocr.process(page_image)
-                    ocr_results.append(result)
-                    hf_filter.collect(result)
-
                     buf = io.BytesIO()
                     page_image.convert("RGB").save(buf, format="JPEG", quality=82)
                     page_jpeg_bytes.append(buf.getvalue())
+                    progress.advance(render_task)
 
+            # ── 阶段 1：并行 OCR ──────────────────────────────────────────
+            workers_label = f" × {self.workers} 线程" if self.workers > 1 else ""
+            ocr_task = progress.add_task(
+                f"[cyan]阶段 1[/]  OCR 识别{workers_label}", total=total
+            )
+
+            ocr_results: List[Optional[OCRResult]] = [None] * total
+
+            with ThreadPoolExecutor(max_workers=self.workers) as pool:
+                futures = {
+                    pool.submit(_ocr_worker, i, jpeg, self.lang): i
+                    for i, jpeg in enumerate(page_jpeg_bytes)
+                }
+                for fut in as_completed(futures):
+                    page_num, result = fut.result()
+                    ocr_results[page_num] = result
                     progress.advance(ocr_task)
 
+            # 收集页眉/页脚候选并 finalize
+            hf_filter = HeaderFooterFilter()
+            for result in ocr_results:
+                hf_filter.collect(result)  # type: ignore[arg-type]
             hf_filter.finalize()
             if self.verbose:
                 _console.print(
                     f"[dim]  检测到 {len(hf_filter._excluded)} 条页眉/页脚模板[/]"
                 )
 
-            # ── 第二遍：版面分析 ─────────────────────────────────────────
+            # ── 阶段 2：串行版面分析 ──────────────────────────────────────
             analyze_task = progress.add_task(
-                "[cyan]第二遍[/]  版面分析", total=total
+                "[cyan]阶段 2[/]  版面分析", total=total
             )
-
             raw_page_elements: List[List[DocumentElement]] = []
 
             for _page_num, (ocr_result, jpeg_bytes) in enumerate(
                 zip(ocr_results, page_jpeg_bytes)
             ):
                 page_image = Image.open(io.BytesIO(jpeg_bytes))
-                elements = analyzer.analyze_page(ocr_result, page_image, hf_filter)
+                elements = analyzer.analyze_page(
+                    ocr_result, page_image, hf_filter  # type: ignore[arg-type]
+                )
                 raw_page_elements.append(elements)
                 progress.advance(analyze_task)
 
-            # ── 跨页段落合并（无 I/O，无需进度条）────────────────────────
+            # ── 后处理：跨页段落合并 ──────────────────────────────────────
             progress.add_task("[cyan]后处理[/]  跨页段落合并", total=None)
 
         # ── 按 H1 标题切分章节 ────────────────────────────────────────────
