@@ -282,13 +282,30 @@ class Pipeline:
                     total=total,
                     completed=total - len(pending_render),
                 )
-                with PDFRenderer(self.pdf_path, dpi=self.dpi) as renderer:
-                    for page_num in pending_render:
-                        img = renderer.render_page(page_num)
-                        buf = io.BytesIO()
-                        img.convert("RGB").save(buf, format="JPEG", quality=82)
-                        ckpt.page_jpeg_bytes[page_num] = buf.getvalue()
-                        progress.advance(render_task)
+                try:
+                    save_counter = 0
+                    with PDFRenderer(self.pdf_path, dpi=self.dpi) as renderer:
+                        for page_num in pending_render:
+                            img = renderer.render_page(page_num)
+                            buf = io.BytesIO()
+                            img.convert("RGB").save(buf, format="JPEG", quality=82)
+                            ckpt.page_jpeg_bytes[page_num] = buf.getvalue()
+                            progress.advance(render_task)
+                            save_counter += 1
+                            if save_counter >= _CKPT_SAVE_INTERVAL:
+                                ckpt.save(ckpt_path)
+                                save_counter = 0
+                    ckpt.save(ckpt_path)
+                except KeyboardInterrupt:
+                    _console.print("\n[yellow]正在保存断点…[/]")
+                    ckpt.save(ckpt_path)
+                    done = sum(1 for b in ckpt.page_jpeg_bytes if b is not None)
+                    _console.print(
+                        f"[yellow]断点已保存至 [bold]{ckpt_path}[/bold]，"
+                        f"已渲染 {done}/{total} 页。\n"
+                        f"下次运行相同命令可自动继续。[/]"
+                    )
+                    raise
 
             # ── 阶段 1：并行 OCR（跳过已完成的页面）────────────────────
             pending_ocr = ckpt.pending_ocr_pages()
