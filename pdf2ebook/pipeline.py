@@ -14,8 +14,10 @@
 
 import io
 import os
+import pickle
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import suppress
 from pathlib import Path
 from typing import List, Optional
 
@@ -44,6 +46,54 @@ from .ocr_processor import OCRProcessor, OCRResult
 from .pdf_renderer import PDFRenderer
 
 _console = Console()
+
+# ── 断点续传 ─────────────────────────────────────────────────────────────────
+_CKPT_VERSION = "pdf2ebook-v1"
+_CKPT_SAVE_INTERVAL = 5  # 每完成 N 页 OCR 保存一次断点
+
+
+class Checkpoint:
+    """断点续传数据容器。
+
+    存储格式：pickle（使用原子写入防止中断时损坏）。
+    包含：所有页面的 JPEG 字节缓存 + OCR 识别结果。
+    """
+
+    def __init__(self, total: int, pdf_mtime: float) -> None:
+        self.version: str = _CKPT_VERSION
+        self.pdf_mtime: float = pdf_mtime
+        self.total: int = total
+        # None 表示该页尚未完成对应阶段
+        self.page_jpeg_bytes: List[Optional[bytes]] = [None] * total
+        self.ocr_results: List[Optional["OCRResult"]] = [None] * total
+
+    # ── 序列化 ──────────────────────────────────────────────────────────
+    def save(self, path: str) -> None:
+        """原子写入：先写 .tmp，再 os.replace，防止中断导致文件损坏。"""
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as f:
+            pickle.dump(self, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, path)
+
+    @classmethod
+    def load(cls, path: str) -> "Checkpoint":
+        with open(path, "rb") as f:
+            obj = pickle.load(f)  # noqa: S301  — 读取本工具自己写的文件，可信
+        if not isinstance(obj, Checkpoint) or obj.version != _CKPT_VERSION:
+            raise ValueError("断点文件格式版本不兼容")
+        return obj
+
+    # ── 状态查询 ────────────────────────────────────────────────────────
+    def completed_ocr_count(self) -> int:
+        return sum(1 for r in self.ocr_results if r is not None)
+
+    def pending_render_pages(self) -> List[int]:
+        """返回尚未渲染的页码列表。"""
+        return [i for i, b in enumerate(self.page_jpeg_bytes) if b is None]
+
+    def pending_ocr_pages(self) -> List[int]:
+        """返回尚未完成 OCR 的页码列表。"""
+        return [i for i, r in enumerate(self.ocr_results) if r is None]
 
 
 def _ocr_worker(page_num: int, jpeg_bytes: bytes, lang: str):
@@ -129,6 +179,7 @@ class Pipeline:
         author: Optional[str] = None,
         verbose: bool = False,
         workers: int = 1,
+        fresh: bool = False,
     ) -> None:
         self.pdf_path = pdf_path
         self.output_dir = output_dir
@@ -137,6 +188,7 @@ class Pipeline:
         self.dpi = dpi
         self.verbose = verbose
         self.workers = max(1, workers)
+        self.fresh = fresh
 
         stem = Path(pdf_path).stem
         self.title = title or stem
@@ -197,7 +249,17 @@ class Pipeline:
 
     # ──────────────────────────────────────────────────────────────────────
     def _build_document(self) -> Document:
+        os.makedirs(self.output_dir, exist_ok=True)
+        ckpt_path = self._checkpoint_path()
+        ckpt = self._load_or_create_checkpoint(ckpt_path)
+        total = ckpt.total
         analyzer = LayoutAnalyzer()
+
+        if self.verbose:
+            _console.print(
+                f"[dim]  PDF 共 {total} 页，DPI={self.dpi}，"
+                f"语言={self.lang}，OCR 线程={self.workers}[/]"
+            )
 
         progress = Progress(
             SpinnerColumn(),
@@ -212,47 +274,66 @@ class Pipeline:
         )
 
         with progress:
-            # ── 阶段 0：串行渲染所有页面为 JPEG 字节缓存 ─────────────────
-            with PDFRenderer(self.pdf_path, dpi=self.dpi) as renderer:
-                total = len(renderer)
-
-            if self.verbose:
-                _console.print(
-                    f"[dim]  PDF 共 {total} 页，DPI={self.dpi}，"
-                    f"语言={self.lang}，OCR 线程={self.workers}[/]"
+            # ── 阶段 0：渲染未完成的页面 ─────────────────────────────────
+            pending_render = ckpt.pending_render_pages()
+            if pending_render:
+                render_task = progress.add_task(
+                    "[cyan]阶段 0[/]  渲染页面",
+                    total=total,
+                    completed=total - len(pending_render),
                 )
+                with PDFRenderer(self.pdf_path, dpi=self.dpi) as renderer:
+                    for page_num in pending_render:
+                        img = renderer.render_page(page_num)
+                        buf = io.BytesIO()
+                        img.convert("RGB").save(buf, format="JPEG", quality=82)
+                        ckpt.page_jpeg_bytes[page_num] = buf.getvalue()
+                        progress.advance(render_task)
 
-            render_task = progress.add_task("[cyan]阶段 0[/]  渲染页面", total=total)
-            page_jpeg_bytes: List[bytes] = []
-
-            with PDFRenderer(self.pdf_path, dpi=self.dpi) as renderer:
-                for _page_num, page_image in renderer.iter_pages():
-                    buf = io.BytesIO()
-                    page_image.convert("RGB").save(buf, format="JPEG", quality=82)
-                    page_jpeg_bytes.append(buf.getvalue())
-                    progress.advance(render_task)
-
-            # ── 阶段 1：并行 OCR ──────────────────────────────────────────
+            # ── 阶段 1：并行 OCR（跳过已完成的页面）────────────────────
+            pending_ocr = ckpt.pending_ocr_pages()
+            already_done = ckpt.completed_ocr_count()
             workers_label = f" × {self.workers} 线程" if self.workers > 1 else ""
             ocr_task = progress.add_task(
-                f"[cyan]阶段 1[/]  OCR 识别{workers_label}", total=total
+                f"[cyan]阶段 1[/]  OCR 识别{workers_label}",
+                total=total,
+                completed=already_done,
             )
 
-            ocr_results: List[Optional[OCRResult]] = [None] * total
+            if pending_ocr:
+                try:
+                    with ThreadPoolExecutor(max_workers=self.workers) as pool:
+                        futures = {
+                            pool.submit(
+                                _ocr_worker, i, ckpt.page_jpeg_bytes[i], self.lang
+                            ): i
+                            for i in pending_ocr
+                        }
+                        save_counter = 0
+                        for fut in as_completed(futures):
+                            page_num, result = fut.result()
+                            ckpt.ocr_results[page_num] = result
+                            progress.advance(ocr_task)
+                            save_counter += 1
+                            if save_counter >= _CKPT_SAVE_INTERVAL:
+                                ckpt.save(ckpt_path)
+                                save_counter = 0
+                    # 全部完成后再保存一次，确保最后几页也持久化
+                    ckpt.save(ckpt_path)
+                except KeyboardInterrupt:
+                    _console.print("\n[yellow]正在保存断点…[/]")
+                    ckpt.save(ckpt_path)
+                    done = ckpt.completed_ocr_count()
+                    _console.print(
+                        f"[yellow]断点已保存至 [bold]{ckpt_path}[/bold]，"
+                        f"已完成 {done}/{total} 页。\n"
+                        f"下次运行相同命令可自动继续。[/]"
+                    )
+                    raise
 
-            with ThreadPoolExecutor(max_workers=self.workers) as pool:
-                futures = {
-                    pool.submit(_ocr_worker, i, jpeg, self.lang): i
-                    for i, jpeg in enumerate(page_jpeg_bytes)
-                }
-                for fut in as_completed(futures):
-                    page_num, result = fut.result()
-                    ocr_results[page_num] = result
-                    progress.advance(ocr_task)
-
-            # 收集页眉/页脚候选并 finalize
+            # ── 阶段 2：版面分析 ─────────────────────────────────────────
             hf_filter = HeaderFooterFilter()
-            for result in ocr_results:
+            for result in ckpt.ocr_results:
                 hf_filter.collect(result)  # type: ignore[arg-type]
             hf_filter.finalize()
             if self.verbose:
@@ -260,23 +341,19 @@ class Pipeline:
                     f"[dim]  检测到 {len(hf_filter._excluded)} 条页眉/页脚模板[/]"
                 )
 
-            # ── 阶段 2：串行版面分析 ──────────────────────────────────────
             analyze_task = progress.add_task(
                 "[cyan]阶段 2[/]  版面分析", total=total
             )
             raw_page_elements: List[List[DocumentElement]] = []
 
-            for _page_num, (ocr_result, jpeg_bytes) in enumerate(
-                zip(ocr_results, page_jpeg_bytes)
-            ):
-                page_image = Image.open(io.BytesIO(jpeg_bytes))
+            for page_num in range(total):
+                page_image = Image.open(io.BytesIO(ckpt.page_jpeg_bytes[page_num]))  # type: ignore[arg-type]
                 elements = analyzer.analyze_page(
-                    ocr_result, page_image, hf_filter  # type: ignore[arg-type]
+                    ckpt.ocr_results[page_num], page_image, hf_filter  # type: ignore[arg-type]
                 )
                 raw_page_elements.append(elements)
                 progress.advance(analyze_task)
 
-            # ── 后处理：跨页段落合并 ──────────────────────────────────────
             progress.add_task("[cyan]后处理[/]  跨页段落合并", total=None)
 
         # ── 按 H1 标题切分章节 ────────────────────────────────────────────
@@ -301,4 +378,52 @@ class Pipeline:
         if not document.chapters:
             document.chapters = [Chapter(title=self.title)]
 
+        # 全流程成功完成，删除断点文件
+        with suppress(OSError):
+            os.unlink(ckpt_path)
+
         return document
+
+    # ──────────────────────────────────────────────────────────────────────
+    def _checkpoint_path(self) -> str:
+        """断点文件路径：<output_dir>/.<stem>.ckpt"""
+        stem = Path(self.pdf_path).stem
+        return os.path.join(self.output_dir, f".{stem}.ckpt")
+
+    def _load_or_create_checkpoint(self, ckpt_path: str) -> Checkpoint:
+        """加载已有断点，或在以下情况下新建：--fresh、文件不存在、文件损坏。"""
+        pdf_mtime = os.path.getmtime(self.pdf_path)
+
+        if self.fresh:
+            with suppress(OSError):
+                os.unlink(ckpt_path)
+            if self.verbose:
+                _console.print("[dim]  --fresh：跳过断点，从头开始。[/]")
+        elif os.path.exists(ckpt_path):
+            try:
+                ckpt = Checkpoint.load(ckpt_path)
+                # 验证：PDF 修改时间和页数必须一致
+                if abs(ckpt.pdf_mtime - pdf_mtime) > 1.0:
+                    raise ValueError("PDF 文件已被修改（mtime 变化）")
+                with PDFRenderer(self.pdf_path, self.dpi) as r:
+                    current_total = len(r)
+                if ckpt.total != current_total:
+                    raise ValueError(
+                        f"断点记录 {ckpt.total} 页 ≠ 当前 PDF {current_total} 页"
+                    )
+                done = ckpt.completed_ocr_count()
+                _console.print(
+                    f"[yellow]发现断点[/]：已完成 [bold]{done}[/bold]/{ckpt.total} 页 OCR，继续处理。\n"
+                    f"[dim]（断点文件：{ckpt_path}）[/]"
+                )
+                return ckpt
+            except Exception as exc:
+                _console.print(
+                    f"[red]断点文件无效（{exc}），已忽略，从头开始。[/]"
+                )
+                with suppress(OSError):
+                    os.unlink(ckpt_path)
+
+        with PDFRenderer(self.pdf_path, self.dpi) as r:
+            total = len(r)
+        return Checkpoint(total, pdf_mtime)

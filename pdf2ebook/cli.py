@@ -47,6 +47,12 @@ _err_console = Console(stderr=True)
     metavar="N",
     help="并行 OCR 线程数（建议 ≤ CPU 核心数；1 = 串行）",
 )
+@click.option(
+    "--fresh",
+    is_flag=True,
+    default=False,
+    help="忽略断点文件，从头开始处理，并删除已保存的断点",
+)
 def main(
     pdf_file: str,
     output: str,
@@ -57,6 +63,7 @@ def main(
     author: str,
     verbose: bool,
     workers: int,
+    fresh: bool,
 ) -> None:
     """将扫描版 PDF 书籍转换为 EPUB 和/或 Typst 格式。
 
@@ -66,6 +73,7 @@ def main(
       pdf2ebook book.pdf -o ./output -f epub -t "书名" -a "作者"
       pdf2ebook book.pdf --dpi 400 --lang chi_tra
       pdf2ebook book.pdf --workers 4
+      pdf2ebook book.pdf --fresh
     """
     try:
         pipeline = Pipeline(
@@ -78,6 +86,7 @@ def main(
             author=author,
             verbose=verbose,
             workers=workers,
+            fresh=fresh,
         )
         pipeline.run()
     except Exception as exc:  # noqa: BLE001
