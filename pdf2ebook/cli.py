@@ -53,6 +53,12 @@ _err_console = Console(stderr=True)
     default=False,
     help="忽略断点文件，从头开始处理，并删除已保存的断点",
 )
+@click.option(
+    "--cache-render", "-C",
+    is_flag=True,
+    default=False,
+    help="将渲染结果缓存到独立文件，下次运行可跳过重复渲染（开发调试用）",
+)
 def main(
     pdf_file: str,
     output: str,
@@ -64,6 +70,7 @@ def main(
     verbose: bool,
     workers: int,
     fresh: bool,
+    cache_render: bool,
 ) -> None:
     """将扫描版 PDF 书籍转换为 EPUB 和/或 Typst 格式。
 
@@ -74,6 +81,7 @@ def main(
       pdf2ebook book.pdf --dpi 400 --lang chi_tra
       pdf2ebook book.pdf --workers 4
       pdf2ebook book.pdf --fresh
+      pdf2ebook book.pdf --cache-render
     """
     try:
         pipeline = Pipeline(
@@ -87,6 +95,7 @@ def main(
             verbose=verbose,
             workers=workers,
             fresh=fresh,
+            cache_render=cache_render,
         )
         pipeline.run()
     except Exception as exc:  # noqa: BLE001

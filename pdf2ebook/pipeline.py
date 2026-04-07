@@ -51,6 +51,50 @@ _console = Console()
 _CKPT_VERSION = "pdf2ebook-v1"
 _CKPT_SAVE_INTERVAL = 5  # 每完成 N 页 OCR 保存一次断点
 
+# ── 渲染缓存 ─────────────────────────────────────────────────────────────────
+_RENDER_CACHE_VERSION = "pdf2ebook-render-v1"
+
+
+class RenderCache:
+    """渲染结果缓存容器。
+
+    将所有页面的 JPEG 字节缓存持久化到独立文件，与断点文件分开存储。
+    缓存键：PDF 修改时间 + DPI + 总页数，三者任一变化则缓存失效。
+    全流程成功后缓存文件**保留**，供下次运行复用。
+    """
+
+    def __init__(self, total: int, pdf_mtime: float, dpi: int) -> None:
+        self.version: str = _RENDER_CACHE_VERSION
+        self.pdf_mtime: float = pdf_mtime
+        self.dpi: int = dpi
+        self.total: int = total
+        self.page_jpeg_bytes: List[Optional[bytes]] = [None] * total
+
+    # ── 序列化 ──────────────────────────────────────────────────────────
+    def save(self, path: str) -> None:
+        """原子写入：先写 .tmp，再 os.replace，防止中断导致文件损坏。"""
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as f:
+            pickle.dump(self, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, path)
+
+    @classmethod
+    def load(cls, path: str) -> "RenderCache":
+        with open(path, "rb") as f:
+            obj = pickle.load(f)  # noqa: S301
+        if not isinstance(obj, RenderCache) or obj.version != _RENDER_CACHE_VERSION:
+            raise ValueError("渲染缓存文件格式版本不兼容")
+        return obj
+
+    # ── 状态查询 ────────────────────────────────────────────────────────
+    def is_complete(self) -> bool:
+        """所有页面均已缓存时返回 True。"""
+        return all(b is not None for b in self.page_jpeg_bytes)
+
+    def pending_pages(self) -> List[int]:
+        """返回尚未缓存的页码列表。"""
+        return [i for i, b in enumerate(self.page_jpeg_bytes) if b is None]
+
 
 class Checkpoint:
     """断点续传数据容器。
@@ -180,6 +224,7 @@ class Pipeline:
         verbose: bool = False,
         workers: int = 1,
         fresh: bool = False,
+        cache_render: bool = False,
     ) -> None:
         self.pdf_path = pdf_path
         self.output_dir = output_dir
@@ -189,6 +234,7 @@ class Pipeline:
         self.verbose = verbose
         self.workers = max(1, workers)
         self.fresh = fresh
+        self.cache_render = cache_render
 
         stem = Path(pdf_path).stem
         self.title = title or stem
@@ -283,22 +329,68 @@ class Pipeline:
                     completed=total - len(pending_render),
                 )
                 try:
+                    # 尝试从渲染缓存中补充已渲染的页面
+                    if self.cache_render:
+                        render_cache = self._load_render_cache()
+                        if render_cache is not None:
+                            hit_pages = []
+                            for page_num in list(pending_render):
+                                cached_bytes = render_cache.page_jpeg_bytes[page_num]
+                                if cached_bytes is not None:
+                                    ckpt.page_jpeg_bytes[page_num] = cached_bytes
+                                    hit_pages.append(page_num)
+                            if hit_pages:
+                                pending_render = ckpt.pending_render_pages()
+                                progress.update(
+                                    render_task,
+                                    completed=total - len(pending_render),
+                                )
+                                if self.verbose:
+                                    _console.print(
+                                        f"[dim]  渲染缓存命中 {len(hit_pages)} 页，"
+                                        f"仍需渲染 {len(pending_render)} 页[/]"
+                                    )
+                    else:
+                        render_cache = None
+
                     save_counter = 0
-                    with PDFRenderer(self.pdf_path, dpi=self.dpi) as renderer:
-                        for page_num in pending_render:
-                            img = renderer.render_page(page_num)
-                            buf = io.BytesIO()
-                            img.convert("RGB").save(buf, format="JPEG", quality=82)
-                            ckpt.page_jpeg_bytes[page_num] = buf.getvalue()
-                            progress.advance(render_task)
-                            save_counter += 1
-                            if save_counter >= _CKPT_SAVE_INTERVAL:
-                                ckpt.save(ckpt_path)
-                                save_counter = 0
+                    if pending_render:
+                        with PDFRenderer(self.pdf_path, dpi=self.dpi) as renderer:
+                            for page_num in pending_render:
+                                img = renderer.render_page(page_num)
+                                buf = io.BytesIO()
+                                img.convert("RGB").save(buf, format="JPEG", quality=82)
+                                jpeg_bytes = buf.getvalue()
+                                ckpt.page_jpeg_bytes[page_num] = jpeg_bytes
+                                # 同步写入渲染缓存对象（延迟持久化）
+                                if self.cache_render:
+                                    if render_cache is None:
+                                        render_cache = RenderCache(
+                                            total,
+                                            os.path.getmtime(self.pdf_path),
+                                            self.dpi,
+                                        )
+                                    render_cache.page_jpeg_bytes[page_num] = jpeg_bytes
+                                progress.advance(render_task)
+                                save_counter += 1
+                                if save_counter >= _CKPT_SAVE_INTERVAL:
+                                    ckpt.save(ckpt_path)
+                                    save_counter = 0
                     ckpt.save(ckpt_path)
+                    # 渲染阶段全部完成后持久化渲染缓存
+                    if self.cache_render and render_cache is not None:
+                        render_cache.save(self._render_cache_path())
+                        if self.verbose:
+                            _console.print(
+                                f"[dim]  渲染缓存已保存至 {self._render_cache_path()}[/]"
+                            )
                 except KeyboardInterrupt:
                     _console.print("\n[yellow]正在保存断点…[/]")
                     ckpt.save(ckpt_path)
+                    # 中断时也保存已完成部分的渲染缓存
+                    if self.cache_render and render_cache is not None:
+                        with suppress(OSError):
+                            render_cache.save(self._render_cache_path())
                     done = sum(1 for b in ckpt.page_jpeg_bytes if b is not None)
                     _console.print(
                         f"[yellow]断点已保存至 [bold]{ckpt_path}[/bold]，"
@@ -407,6 +499,42 @@ class Pipeline:
         stem = Path(self.pdf_path).stem
         return os.path.join(self.output_dir, f".{stem}.ckpt")
 
+    def _render_cache_path(self) -> str:
+        """渲染缓存文件路径：<output_dir>/.<stem>.render.ckpt"""
+        stem = Path(self.pdf_path).stem
+        return os.path.join(self.output_dir, f".{stem}.render.ckpt")
+
+    def _load_render_cache(self) -> "Optional[RenderCache]":
+        """尝试加载渲染缓存；缓存不存在、版本不符或参数不一致时返回 None。"""
+        cache_path = self._render_cache_path()
+        if not os.path.exists(cache_path):
+            return None
+        try:
+            cache = RenderCache.load(cache_path)
+            pdf_mtime = os.path.getmtime(self.pdf_path)
+            if abs(cache.pdf_mtime - pdf_mtime) > 1.0:
+                raise ValueError("PDF 文件已被修改（mtime 变化）")
+            if cache.dpi != self.dpi:
+                raise ValueError(f"DPI 不符：缓存 {cache.dpi} ≠ 当前 {self.dpi}")
+            with PDFRenderer(self.pdf_path, self.dpi) as r:
+                current_total = len(r)
+            if cache.total != current_total:
+                raise ValueError(
+                    f"缓存记录 {cache.total} 页 ≠ 当前 PDF {current_total} 页"
+                )
+            done = sum(1 for b in cache.page_jpeg_bytes if b is not None)
+            _console.print(
+                f"[yellow]发现渲染缓存[/]：已缓存 [bold]{done}[/bold]/{cache.total} 页，"
+                f"DPI={cache.dpi}。\n"
+                f"[dim]（缓存文件：{cache_path}）[/]"
+            )
+            return cache
+        except Exception as exc:
+            _console.print(f"[red]渲染缓存无效（{exc}），已忽略。[/]")
+            with suppress(OSError):
+                os.unlink(cache_path)
+            return None
+
     def _load_or_create_checkpoint(self, ckpt_path: str) -> Checkpoint:
         """加载已有断点，或在以下情况下新建：--fresh、文件不存在、文件损坏。"""
         pdf_mtime = os.path.getmtime(self.pdf_path)
@@ -414,6 +542,9 @@ class Pipeline:
         if self.fresh:
             with suppress(OSError):
                 os.unlink(ckpt_path)
+            if self.cache_render:
+                with suppress(OSError):
+                    os.unlink(self._render_cache_path())
             if self.verbose:
                 _console.print("[dim]  --fresh：跳过断点，从头开始。[/]")
         elif os.path.exists(ckpt_path):
