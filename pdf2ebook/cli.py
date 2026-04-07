@@ -59,6 +59,12 @@ _err_console = Console(stderr=True)
     default=False,
     help="将渲染结果缓存到独立文件，下次运行可跳过重复渲染（开发调试用）",
 )
+@click.option(
+    "--cache-ocr", "-O",
+    is_flag=True,
+    default=False,
+    help="将 OCR 识别结果缓存到独立文件，下次运行可跳过重复识别（开发调试用）",
+)
 def main(
     pdf_file: str,
     output: str,
@@ -71,6 +77,7 @@ def main(
     workers: int,
     fresh: bool,
     cache_render: bool,
+    cache_ocr: bool,
 ) -> None:
     """将扫描版 PDF 书籍转换为 EPUB 和/或 Typst 格式。
 
@@ -82,6 +89,8 @@ def main(
       pdf2ebook book.pdf --workers 4
       pdf2ebook book.pdf --fresh
       pdf2ebook book.pdf --cache-render
+      pdf2ebook book.pdf --cache-ocr
+      pdf2ebook book.pdf -C -O
     """
     try:
         pipeline = Pipeline(
@@ -96,6 +105,7 @@ def main(
             workers=workers,
             fresh=fresh,
             cache_render=cache_render,
+            cache_ocr=cache_ocr,
         )
         pipeline.run()
     except Exception as exc:  # noqa: BLE001

@@ -54,6 +54,53 @@ _CKPT_SAVE_INTERVAL = 5  # 每完成 N 页 OCR 保存一次断点
 # ── 渲染缓存 ─────────────────────────────────────────────────────────────────
 _RENDER_CACHE_VERSION = "pdf2ebook-render-v1"
 
+# ── OCR 缓存 ──────────────────────────────────────────────────────────────────
+_OCR_CACHE_VERSION = "pdf2ebook-ocr-v1"
+
+
+class OcrCache:
+    """OCR 识别结果缓存容器。
+
+    将所有页面的 OCRResult 持久化到独立文件，与断点文件和渲染缓存分开存储。
+    缓存键：PDF 修改时间 + lang + 总页数，三者任一变化则缓存失效。
+    全流程成功后缓存文件**保留**，供下次运行复用。
+    """
+
+    def __init__(self, total: int, pdf_mtime: float, lang: str) -> None:
+        self.version: str = _OCR_CACHE_VERSION
+        self.pdf_mtime: float = pdf_mtime
+        self.lang: str = lang
+        self.total: int = total
+        self.ocr_results: List[Optional["OCRResult"]] = [None] * total
+
+    # ── 序列化 ──────────────────────────────────────────────────────────
+    def save(self, path: str) -> None:
+        """原子写入：先写 .tmp，再 os.replace，防止中断导致文件损坏。"""
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as f:
+            pickle.dump(self, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, path)
+
+    @classmethod
+    def load(cls, path: str) -> "OcrCache":
+        with open(path, "rb") as f:
+            obj = pickle.load(f)  # noqa: S301
+        if not isinstance(obj, OcrCache) or obj.version != _OCR_CACHE_VERSION:
+            raise ValueError("OCR 缓存文件格式版本不兼容")
+        return obj
+
+    # ── 状态查询 ────────────────────────────────────────────────────────
+    def is_complete(self) -> bool:
+        """所有页面均已缓存时返回 True。"""
+        return all(r is not None for r in self.ocr_results)
+
+    def completed_count(self) -> int:
+        return sum(1 for r in self.ocr_results if r is not None)
+
+    def pending_pages(self) -> List[int]:
+        """返回尚未缓存的页码列表。"""
+        return [i for i, r in enumerate(self.ocr_results) if r is None]
+
 
 class RenderCache:
     """渲染结果缓存容器。
@@ -225,6 +272,7 @@ class Pipeline:
         workers: int = 1,
         fresh: bool = False,
         cache_render: bool = False,
+        cache_ocr: bool = False,
     ) -> None:
         self.pdf_path = pdf_path
         self.output_dir = output_dir
@@ -235,6 +283,7 @@ class Pipeline:
         self.workers = max(1, workers)
         self.fresh = fresh
         self.cache_render = cache_render
+        self.cache_ocr = cache_ocr
 
         stem = Path(pdf_path).stem
         self.title = title or stem
@@ -411,27 +460,70 @@ class Pipeline:
 
             if pending_ocr:
                 try:
-                    with ThreadPoolExecutor(max_workers=self.workers) as pool:
-                        futures = {
-                            pool.submit(
-                                _ocr_worker, i, ckpt.page_jpeg_bytes[i], self.lang
-                            ): i
-                            for i in pending_ocr
-                        }
-                        save_counter = 0
-                        for fut in as_completed(futures):
-                            page_num, result = fut.result()
-                            ckpt.ocr_results[page_num] = result
-                            progress.advance(ocr_task)
-                            save_counter += 1
-                            if save_counter >= _CKPT_SAVE_INTERVAL:
-                                ckpt.save(ckpt_path)
-                                save_counter = 0
+                    # 尝试从 OCR 缓存中补充已识别的页面
+                    if self.cache_ocr:
+                        ocr_cache = self._load_ocr_cache()
+                        if ocr_cache is not None:
+                            hit_pages = []
+                            for page_num in list(pending_ocr):
+                                cached_result = ocr_cache.ocr_results[page_num]
+                                if cached_result is not None:
+                                    ckpt.ocr_results[page_num] = cached_result
+                                    hit_pages.append(page_num)
+                            if hit_pages:
+                                pending_ocr = ckpt.pending_ocr_pages()
+                                already_done = ckpt.completed_ocr_count()
+                                progress.update(ocr_task, completed=already_done)
+                                if self.verbose:
+                                    _console.print(
+                                        f"[dim]  OCR 缓存命中 {len(hit_pages)} 页，"
+                                        f"仍需识别 {len(pending_ocr)} 页[/]"
+                                    )
+                    else:
+                        ocr_cache = None
+
+                    if pending_ocr:
+                        with ThreadPoolExecutor(max_workers=self.workers) as pool:
+                            futures = {
+                                pool.submit(
+                                    _ocr_worker, i, ckpt.page_jpeg_bytes[i], self.lang
+                                ): i
+                                for i in pending_ocr
+                            }
+                            save_counter = 0
+                            for fut in as_completed(futures):
+                                page_num, result = fut.result()
+                                ckpt.ocr_results[page_num] = result
+                                # 同步写入 OCR 缓存对象（延迟持久化）
+                                if self.cache_ocr:
+                                    if ocr_cache is None:
+                                        ocr_cache = OcrCache(
+                                            total,
+                                            os.path.getmtime(self.pdf_path),
+                                            self.lang,
+                                        )
+                                    ocr_cache.ocr_results[page_num] = result
+                                progress.advance(ocr_task)
+                                save_counter += 1
+                                if save_counter >= _CKPT_SAVE_INTERVAL:
+                                    ckpt.save(ckpt_path)
+                                    save_counter = 0
                     # 全部完成后再保存一次，确保最后几页也持久化
                     ckpt.save(ckpt_path)
+                    # OCR 阶段全部完成后持久化 OCR 缓存
+                    if self.cache_ocr and ocr_cache is not None:
+                        ocr_cache.save(self._ocr_cache_path())
+                        if self.verbose:
+                            _console.print(
+                                f"[dim]  OCR 缓存已保存至 {self._ocr_cache_path()}[/]"
+                            )
                 except KeyboardInterrupt:
                     _console.print("\n[yellow]正在保存断点…[/]")
                     ckpt.save(ckpt_path)
+                    # 中断时也保存已完成部分的 OCR 缓存
+                    if self.cache_ocr and ocr_cache is not None:
+                        with suppress(OSError):
+                            ocr_cache.save(self._ocr_cache_path())
                     done = ckpt.completed_ocr_count()
                     _console.print(
                         f"[yellow]断点已保存至 [bold]{ckpt_path}[/bold]，"
@@ -504,6 +596,42 @@ class Pipeline:
         stem = Path(self.pdf_path).stem
         return os.path.join(self.output_dir, f".{stem}.render.ckpt")
 
+    def _ocr_cache_path(self) -> str:
+        """OCR 缓存文件路径：<output_dir>/.<stem>.ocr.ckpt"""
+        stem = Path(self.pdf_path).stem
+        return os.path.join(self.output_dir, f".{stem}.ocr.ckpt")
+
+    def _load_ocr_cache(self) -> "Optional[OcrCache]":
+        """尝试加载 OCR 缓存；缓存不存在、版本不符或参数不一致时返回 None。"""
+        cache_path = self._ocr_cache_path()
+        if not os.path.exists(cache_path):
+            return None
+        try:
+            cache = OcrCache.load(cache_path)
+            pdf_mtime = os.path.getmtime(self.pdf_path)
+            if abs(cache.pdf_mtime - pdf_mtime) > 1.0:
+                raise ValueError("PDF 文件已被修改（mtime 变化）")
+            if cache.lang != self.lang:
+                raise ValueError(f"语言不符：缓存 {cache.lang!r} ≠ 当前 {self.lang!r}")
+            with PDFRenderer(self.pdf_path, self.dpi) as r:
+                current_total = len(r)
+            if cache.total != current_total:
+                raise ValueError(
+                    f"缓存记录 {cache.total} 页 ≠ 当前 PDF {current_total} 页"
+                )
+            done = cache.completed_count()
+            _console.print(
+                f"[yellow]发现 OCR 缓存[/]：已缓存 [bold]{done}[/bold]/{cache.total} 页，"
+                f"语言={cache.lang!r}。\n"
+                f"[dim]（缓存文件：{cache_path}）[/]"
+            )
+            return cache
+        except Exception as exc:
+            _console.print(f"[red]OCR 缓存无效（{exc}），已忽略。[/]")
+            with suppress(OSError):
+                os.unlink(cache_path)
+            return None
+
     def _load_render_cache(self) -> "Optional[RenderCache]":
         """尝试加载渲染缓存；缓存不存在、版本不符或参数不一致时返回 None。"""
         cache_path = self._render_cache_path()
@@ -545,6 +673,9 @@ class Pipeline:
             if self.cache_render:
                 with suppress(OSError):
                     os.unlink(self._render_cache_path())
+            if self.cache_ocr:
+                with suppress(OSError):
+                    os.unlink(self._ocr_cache_path())
             if self.verbose:
                 _console.print("[dim]  --fresh：跳过断点，从头开始。[/]")
         elif os.path.exists(ckpt_path):
